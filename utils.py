@@ -116,8 +116,9 @@ class ConcatModelDataset(LazyTextDataset):
         history_text = ''
         
         if not self._include_skipped:
-            history = np.asarray(history)
-            history = history[:, 0:2].tolist()
+            if len(history) > 0:
+                history = np.asarray(history)
+                history = history[:, 0:2].tolist()
         
         for history_turn in history:
             for history_behavior in history_turn:
