@@ -138,9 +138,19 @@ class ConcatModelDataset(LazyTextDataset):
         input_mask = np.asarray(features[0].input_mask)
         ranker_label_ids = features[0].label_id
         
+        # construct hier mask:
+        # e.g. input_ids: [101, 2, 2, 2, 102, 3, 3, 3, 102, 4, 102, 5, 102, 6, 6, 102, 0, 0]
+        #      hier_mask: [-1 , 5, 5, 5, -1 , 4, 4, 4, -1 , 3, -1 , 2, -1 , 1, 1, -1 , 0, 0]
+        sep_indices = np.where(input_ids == 102)[0]
+        hier_mask = np.zeros_like(input_ids)
+        for sep_index in sep_indices:
+            hier_mask[: sep_index + 1] += 1
+        hier_mask[sep_indices] = -1
+        hier_mask[0] = -1
+        
         # the history mask is not used
         return {'input_ids': input_ids, 'segment_ids': segment_ids, 'input_mask': input_mask,
-               'ranker_label_ids': ranker_label_ids, 'guid': guid, 'history_mask': 1}
+               'ranker_label_ids': ranker_label_ids, 'guid': guid, 'history_mask': 1, 'hier_mask': hier_mask}
 
 
 def convert_examples_to_features(examples, label_list, max_seq_length,

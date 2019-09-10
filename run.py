@@ -30,7 +30,7 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
 
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig, BertTokenizer)
-from modeling import BertConcatForStatefulSearch
+from modeling import BertConcatForStatefulSearch, HierBertConcatForStatefulSearch
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_CLASSES = {
     'bert': (BertConfig, BertConcatForStatefulSearch, BertTokenizer),
+    'hier': (BertConfig, HierBertConcatForStatefulSearch, BertTokenizer)
 }
-
 
 def set_seed(args):
     random.seed(args.seed)
@@ -77,7 +77,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
-                                  batch_size=args.train_batch_size, num_workers=8)
+                                  batch_size=args.train_batch_size, num_workers=args.num_workers)
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -136,6 +136,8 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                       'attention_mask': batch['input_mask'],
                       'token_type_ids': batch['segment_ids'],
                       'labels':         batch['ranker_label_ids']}
+            if args.model_type == 'hier':
+                inputs['hier_mask'] = batch['hier_mask']
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
@@ -226,7 +228,7 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
     # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, 
-                                 batch_size=args.eval_batch_size, num_workers=8)
+                                 batch_size=args.eval_batch_size, num_workers=args.num_workers)
 
     # Eval!
     logger.info("***** Running evaluation {} *****".format(prefix))
@@ -248,6 +250,8 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
                       'attention_mask': batch['input_mask'],
                       'token_type_ids': batch['segment_ids'],
                       'labels':         batch['ranker_label_ids']}
+            if args.model_type == 'hier':
+                inputs['hier_mask'] = batch['hier_mask']
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
             eval_loss += tmp_eval_loss.mean().item()
@@ -296,13 +300,13 @@ def main():
     ## Required parameters
     parser.add_argument("--data_dir", default='/mnt/scratch/chenqu/aol/preprocessed/', type=str, required=False,
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-    parser.add_argument("--model_type", default='bert', type=str, required=False,
+    parser.add_argument("--model_type", default='hier', type=str, required=False,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
     parser.add_argument("--model_name_or_path", default='/mnt/scratch/chenqu/huggingface/', type=str, required=False,
                         help="Path to pre-trained model or shortcut name")
     parser.add_argument("--task_name", default='stateful_search', type=str, required=False,
                         help="The name of the task to train")
-    parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/12/', type=str, required=False,
+    parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/20000/', type=str, required=False,
                         help="The output directory where the model predictions and checkpoints will be written.")
 
     ## Other parameters
@@ -324,11 +328,11 @@ def main():
     parser.add_argument("--do_lower_case", default=True, type=str2bool,
                         help="Set this flag if you are using an uncased model.")
 
-    parser.add_argument("--per_gpu_train_batch_size", default=32, type=int,
+    parser.add_argument("--per_gpu_train_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for training.")
-    parser.add_argument("--per_gpu_eval_batch_size", default=32, type=int,
+    parser.add_argument("--per_gpu_eval_batch_size", default=2, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument("--per_gpu_test_batch_size", default=4, type=int,
+    parser.add_argument("--per_gpu_test_batch_size", default=2, type=int,
                         help="Batch size per GPU/CPU for testing.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
@@ -349,7 +353,7 @@ def main():
 
     parser.add_argument('--logging_steps', type=int, default=5,
                         help="Log and save checkpoint every X updates steps.")
-    parser.add_argument('--save_steps', type=int, default=500,
+    parser.add_argument('--save_steps', type=int, default=5000,
                         help="Save checkpoint every X updates steps, this is disabled in our code")
     parser.add_argument("--eval_all_checkpoints", default=False, type=str2bool,
                         help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
@@ -382,9 +386,11 @@ def main():
     parser.add_argument("--load_small", default=False, type=str2bool, required=False,
                         help="whether to just a small portion of data during development")
     parser.add_argument("--dataset", default='aol', type=str, required=False,
-                        help="aol or bing. For bing data, we do not use the first query in a session")
+                        help="aol or msmarco. For bing data, we do not use the first query in a session")
     parser.add_argument("--history_num", default=2, type=int, required=False,
                         help="number of history turns to concat")
+    parser.add_argument("--num_workers", default=2, type=int, required=False,
+                        help="number of workers for dataloader")
     
     # args = parser.parse_args()
     args, unknown = parser.parse_known_args()
@@ -454,7 +460,7 @@ def main():
         train_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_train.txt"), args.include_skipped,
                                    args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
                                      args.history_num)
-        eval_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_dev.txt"), args.include_skipped, 
+        eval_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_dev_small.txt"), args.include_skipped, 
                                     args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
                                      args.history_num)
         test_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_test.txt"), args.include_skipped, 
