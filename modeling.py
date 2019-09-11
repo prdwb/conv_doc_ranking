@@ -2,7 +2,7 @@ from pytorch_transformers import BertModel, BertPreTrainedModel
 from pytorch_transformers.modeling_bert import BertEncoder, BertOutput, BertAttention, BertIntermediate, BertLayer
 import torch
 from torch import nn
-from torch.nn import CrossEntropyLoss, MultiheadAttention
+from torch.nn import CrossEntropyLoss
 
 
 class BertConcatForStatefulSearch(BertPreTrainedModel):
@@ -162,6 +162,9 @@ class HierBertLayer(nn.Module):
         self.output = HierBertOutput(config)
         
         self.hier = HierAttentionLayer(config)
+        # self.hier.att.attention.load_state_dict(self.attention.state_dict())
+        # self.hier.att.intermediate.load_state_dict(self.intermediate.state_dict())
+        # self.hier.att.output.load_state_dict(self.output.state_dict())
 
     def forward(self, hidden_states, attention_mask, head_mask=None, hier_mask=None):
         attention_outputs = self.attention(hidden_states, attention_mask, head_mask)
@@ -201,11 +204,14 @@ class HierAttentionLayer(nn.Module):
         attention_mask_list = []
         hidden_states_list = []
         target_ids = [-1] + list(range(1, hier_mask.max() + 1))
+
         for target_id in target_ids:
             mask = torch.zeros_like(hier_mask, device=hier_mask.device, dtype=torch.float)
-            mask[mask == target_id] = 1.0
+            mask[hier_mask == target_id] = 1.0
             attention_mask_list.append(mask)
             hidden_states_list.append(hidden_states)
+
+        
         attention_mask = torch.cat(attention_mask_list, dim=0)
         all_hidden_states = torch.cat(hidden_states_list, dim=0)
         
