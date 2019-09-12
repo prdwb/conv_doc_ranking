@@ -17,6 +17,7 @@
 
 from __future__ import absolute_import, division, print_function
 
+import torch
 import csv
 import logging
 import os
@@ -145,8 +146,8 @@ class ConcatModelDataset(LazyTextDataset):
         hier_mask = np.zeros_like(input_ids)
         for sep_index in sep_indices:
             hier_mask[: sep_index + 1] += 1
-        hier_mask[sep_indices] = -1
-        hier_mask[0] = -1
+        # hier_mask[sep_indices] = -1
+        # hier_mask[0] = -1
         
         # the history mask is not used
         return {'input_ids': input_ids, 'segment_ids': segment_ids, 'input_mask': input_mask,

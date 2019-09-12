@@ -1,8 +1,9 @@
+import torch
 from pytorch_transformers import BertModel, BertPreTrainedModel
 from pytorch_transformers.modeling_bert import BertEncoder, BertOutput, BertAttention, BertIntermediate, BertLayer
-import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
+from copy import deepcopy
 
 
 class BertConcatForStatefulSearch(BertPreTrainedModel):
@@ -68,6 +69,8 @@ class HierBertConcatForStatefulSearch(BertConcatForStatefulSearch):
         
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, head_mask=None, hier_mask=None):
+        # print('input_ids', input_ids)
+        # print('hier_mask', hier_mask)
         outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
                             attention_mask=attention_mask, head_mask=head_mask, hier_mask=hier_mask)
         pooled_output = outputs[1]
@@ -159,34 +162,36 @@ class HierBertLayer(nn.Module):
         super(HierBertLayer, self).__init__()
         self.attention = BertAttention(config)
         self.intermediate = BertIntermediate(config)
-        self.output = HierBertOutput(config)
+        self.output = BertOutput(config)
         
         self.hier = HierAttentionLayer(config)
-        # self.hier.att.attention.load_state_dict(self.attention.state_dict())
-        # self.hier.att.intermediate.load_state_dict(self.intermediate.state_dict())
-        # self.hier.att.output.load_state_dict(self.output.state_dict())
+        # self.dense = nn.Linear(2 * config.hidden_size, config.hidden_size)
 
     def forward(self, hidden_states, attention_mask, head_mask=None, hier_mask=None):
         attention_outputs = self.attention(hidden_states, attention_mask, head_mask)
-        attention_output = attention_outputs[0]
-        intermediate_output = self.intermediate(attention_output)
-        
+        attention_output = attention_outputs[0]                
         hier_output = self.hier(hidden_states, hier_mask)
+        combined_output = attention_output + hier_output
+        
+        intermediate_output = self.intermediate(combined_output)
+        # attention_hier_concat = torch.cat((attention_output, hier_output), dim=2)
+        # intermediate_output = self.intermediate(self.dense(attention_hier_concat))
                 
-        layer_output = self.output(intermediate_output, attention_output, hier_output)
+        layer_output = self.output(intermediate_output, combined_output)
         outputs = (layer_output,) + attention_outputs[1:]  # add attentions if we output them
                 
         return outputs
     
-class HierBertOutput(BertOutput):
-    def __init__(self, config):
-        super(HierBertOutput, self).__init__(config)
+# class HierBertOutput(BertOutput):
+#     def __init__(self, config):
+#         super(HierBertOutput, self).__init__(config)
 
-    def forward(self, hidden_states, input_tensor, hier_output):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor + hier_output)
-        return hidden_states
+#     def forward(self, hidden_states, input_tensor, hier_output):
+#         print('hidden_states in bert output', hidden_states.size())
+#         hidden_states = self.dense(hidden_states)
+#         hidden_states = self.dropout(hidden_states)
+#         hidden_states = self.LayerNorm(hidden_states + input_tensor)
+#         return hidden_states
     
     
 class HierAttentionLayer(nn.Module):
@@ -203,17 +208,21 @@ class HierAttentionLayer(nn.Module):
         
         attention_mask_list = []
         hidden_states_list = []
-        target_ids = [-1] + list(range(1, hier_mask.max() + 1))
-
+        # target_ids = [-1] + list(range(1, hier_mask.max() + 1))
+        target_ids = list(range(1, hier_mask.max() + 1))
+        # print('target_ids', target_ids)
+    
         for target_id in target_ids:
             mask = torch.zeros_like(hier_mask, device=hier_mask.device, dtype=torch.float)
             mask[hier_mask == target_id] = 1.0
-            attention_mask_list.append(mask)
+            attention_mask_list.append(deepcopy(mask))
             hidden_states_list.append(hidden_states)
-
+        # print('attention_mask_list', attention_mask_list)
         
         attention_mask = torch.cat(attention_mask_list, dim=0)
         all_hidden_states = torch.cat(hidden_states_list, dim=0)
+        # print('attention_mask size', attention_mask.size())
+        # print('all_hidden_states size', all_hidden_states.size())
         
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
@@ -223,8 +232,10 @@ class HierAttentionLayer(nn.Module):
         outputs = layer_outputs[0]
         
         splits = outputs.split(batch_size, dim=0)
-        hier_output = torch.zeros_like(hidden_states, device=hidden_states.device)
+        hier_output = torch.zeros_like(hidden_states, device=hidden_states.device, dtype=torch.float)
         for split, mask in zip(splits, attention_mask_list):
+            # print('split size', split.size())
+            # print('mask size', mask.size())
             hier_output += split * mask.unsqueeze(-1)
             
         return hier_output
