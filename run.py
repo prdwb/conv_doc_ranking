@@ -6,7 +6,7 @@
 
 # import os
 # os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"]="3"
+# os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 
 
 # In[2]:
@@ -122,7 +122,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
 
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
-    best_eval_mrr = 0.0
+    
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
@@ -138,6 +138,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
+                # print('hier_mask', batch['hier_mask'])
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
@@ -170,32 +171,41 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     # Save model checkpoint if it outperforms previous models
                     # Only evaluate when single GPU otherwise metrics may not average well
-                    if args.local_rank == -1 and args.evaluate_during_training:
-                        results, eval_output = evaluate(args, eval_dataset, model, 
-                                                        tokenizer, args.per_gpu_eval_batch_size)
-                        for key, value in results.items():
-                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+                    output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+                    model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+                    model_to_save.save_pretrained(output_dir)
+                    torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+                    logger.info("Saving model checkpoint to %s", output_dir)
                     
-                    if results['mrr'] > best_eval_mrr:
-                        best_eval_mrr = results['mrr']
-                        output_dir = os.path.join(args.output_dir, 'checkpoint')
-                        if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)
-                        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
-                        model_to_save.save_pretrained(output_dir)
-                        torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-                        logger.info("Saving model checkpoint to %s", output_dir)
-                        
-                        output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
-                        with open(output_eval_file, "w") as writer:
-                            logger.info("***** Best eval results so far *****")
-                            for key in sorted(results.keys()):
-                                logger.info("  %s = %s", key, str(results[key]))
-                                writer.write("%s = %s\n" % (key, str(results[key])))
-                                
-                        output_eval_preds_file = os.path.join(args.output_dir, "eval_preds.txt")
-                        with open(output_eval_preds_file, 'w') as writer:
-                            json.dump(eval_output, writer)
+                    
+#                     if args.local_rank == -1 and args.evaluate_during_training:
+#                         results, eval_output = evaluate(args, eval_dataset, model, 
+#                                                     tokenizer, args.per_gpu_eval_batch_size)
+#                         for key, value in results.items():
+#                             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+
+#                     if results['mrr'] > best_eval_mrr:
+#                         best_eval_mrr = results['mrr']
+#                         output_dir = os.path.join(args.output_dir, 'checkpoint')
+#                         if not os.path.exists(output_dir):
+#                             os.makedirs(output_dir)
+#                         model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+#                         model_to_save.save_pretrained(output_dir)
+#                         torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+#                         logger.info("Saving model checkpoint to %s", output_dir)
+
+#                         output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
+#                         with open(output_eval_file, "w") as writer:
+#                             logger.info("***** Best eval results so far *****")
+#                             for key in sorted(results.keys()):
+#                                 logger.info("  %s = %s", key, str(results[key]))
+#                                 writer.write("%s = %s\n" % (key, str(results[key])))
+
+#                         output_eval_preds_file = os.path.join(args.output_dir, "eval_preds.txt")
+#                         with open(output_eval_preds_file, 'w') as writer:
+#                             json.dump(eval_output, writer)
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -252,6 +262,7 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
+                
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
             eval_loss += tmp_eval_loss.mean().item()
@@ -300,13 +311,13 @@ parser = argparse.ArgumentParser()
 ## Required parameters
 parser.add_argument("--data_dir", default='/mnt/scratch/chenqu/aol/preprocessed/', type=str, required=False,
                     help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-parser.add_argument("--model_type", default='hier', type=str, required=False,
+parser.add_argument("--model_type", default='bert', type=str, required=False,
                     help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
 parser.add_argument("--model_name_or_path", default='/mnt/scratch/chenqu/huggingface/', type=str, required=False,
                     help="Path to pre-trained model or shortcut name")
 parser.add_argument("--task_name", default='stateful_search', type=str, required=False,
                     help="The name of the task to train")
-parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/20000/', type=str, required=False,
+parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/bert/', type=str, required=False,
                     help="The output directory where the model predictions and checkpoints will be written.")
 
 ## Other parameters
@@ -328,7 +339,7 @@ parser.add_argument("--evaluate_during_training", default=True, type=str2bool,
 parser.add_argument("--do_lower_case", default=True, type=str2bool,
                     help="Set this flag if you are using an uncased model.")
 
-parser.add_argument("--per_gpu_train_batch_size", default=4, type=int,
+parser.add_argument("--per_gpu_train_batch_size", default=6, type=int,
                     help="Batch size per GPU/CPU for training.")
 parser.add_argument("--per_gpu_eval_batch_size", default=2, type=int,
                     help="Batch size per GPU/CPU for evaluation.")
@@ -336,7 +347,7 @@ parser.add_argument("--per_gpu_test_batch_size", default=2, type=int,
                     help="Batch size per GPU/CPU for testing.")
 parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                     help="Number of updates steps to accumulate before performing a backward/update pass.")
-parser.add_argument("--learning_rate", default=3e-5, type=float,
+parser.add_argument("--learning_rate", default=1e-4, type=float,
                     help="The initial learning rate for Adam.")
 parser.add_argument("--weight_decay", default=0.0, type=float,
                     help="Weight decay if we apply some.")
@@ -353,7 +364,7 @@ parser.add_argument("--warmup_steps", default=0, type=int,
 
 parser.add_argument('--logging_steps', type=int, default=5,
                     help="Log and save checkpoint every X updates steps.")
-parser.add_argument('--save_steps', type=int, default=5000,
+parser.add_argument('--save_steps', type=int, default=5,
                     help="Save checkpoint every X updates steps, this is disabled in our code")
 parser.add_argument("--eval_all_checkpoints", default=False, type=str2bool,
                     help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
@@ -383,11 +394,11 @@ parser.add_argument("--enable_turn_id_embeddings", default=True, type=str2bool, 
                     help="whether to enable turn id embeddings")
 parser.add_argument("--enable_component_embeddings", default=True, type=str2bool, required=False,
                     help="whether to enable component embeddings")
-parser.add_argument("--load_small", default=False, type=str2bool, required=False,
+parser.add_argument("--load_small", default=True, type=str2bool, required=False,
                     help="whether to just a small portion of data during development")
 parser.add_argument("--dataset", default='aol', type=str, required=False,
                     help="aol or msmarco. For bing data, we do not use the first query in a session")
-parser.add_argument("--history_num", default=2, type=int, required=False,
+parser.add_argument("--history_num", default=1, type=int, required=False,
                     help="number of history turns to concat")
 parser.add_argument("--num_workers", default=2, type=int, required=False,
                     help="number of workers for dataloader")
@@ -498,13 +509,45 @@ if args.do_train:
 #         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
 #         model.to(args.device)
 
+best_eval_mrr = 0.0
+best_global_step = 0
+results = {}
+if args.do_eval and args.local_rank in [-1, 0]:
+    logger.info("Eval on all checkpoints with dev set")
+    tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+    checkpoints = [args.output_dir]
+    checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+    logging.getLogger("pytorch_transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+    logger.info("Evaluate the following checkpoints: %s", checkpoints)
+    for checkpoint in checkpoints:
+        global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+        model = model_class.from_pretrained(checkpoint)
+        model.to(args.device)
+        result, eval_output = evaluate(args, eval_dataset, model, tokenizer, 
+                                       args.per_gpu_eval_batch_size, prefix=global_step)
+        if result['mrr'] > best_eval_mrr:
+            best_global_step = global_step
+            best_eval_mrr = result['mrr']
+        
+        result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+        results.update(result)       
+
+        output_eval_preds_file = os.path.join(args.output_dir, "eval_preds_{}.txt".format(global_step))
+        with open(output_eval_preds_file, 'w') as writer:
+            json.dump(eval_output, writer)
+            
+    results['best_global_step'] = best_global_step
+    output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
+    with open(output_eval_file, "w") as writer:
+        for key in sorted(results.keys()):
+            writer.write("%s = %s\n" % (key, str(results[key])))
+
 
 # Evaluation on test set
-results = {}
 if args.do_eval and args.local_rank in [-1, 0]:
     tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
     logger.info("Testing")
-    model = model_class.from_pretrained(os.path.join(args.output_dir, 'checkpoint'))
+    model = model_class.from_pretrained(os.path.join(args.output_dir, 'checkpoint-{}'.format(best_global_step)))
     model.to(args.device)
     result, test_output = evaluate(args, test_dataset, model, 
                                    tokenizer, args.per_gpu_test_batch_size, prefix='test')
@@ -523,15 +566,9 @@ if args.do_eval and args.local_rank in [-1, 0]:
     # return results
 
 
-# In[ ]:
+# In[7]:
 
 
 # if __name__ == "__main__":
 #     main()
-
-
-# In[ ]:
-
-
-
 
