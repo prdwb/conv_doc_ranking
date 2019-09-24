@@ -6,7 +6,7 @@
 
 # import os
 # os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
+# os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 
 # In[2]:
@@ -30,7 +30,9 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
 
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig, BertTokenizer)
-from modeling import BertConcatForStatefulSearch, HierBertConcatForStatefulSearch
+from modeling import (BertConcatForStatefulSearch, 
+                      BehaviorAwareBertConcatForStatefulSearch, 
+                      HierBertConcatForStatefulSearch,)
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
@@ -45,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_CLASSES = {
     'bert': (BertConfig, BertConcatForStatefulSearch, BertTokenizer),
+    'ba_bert': (BertConfig, BehaviorAwareBertConcatForStatefulSearch, BertTokenizer),
     'hier': (BertConfig, HierBertConcatForStatefulSearch, BertTokenizer)
 }
 
@@ -87,11 +90,13 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
 
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
+    # no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon, correct_bias=True)
+    args.warmup_steps = int(t_total * args.warmup_portion)
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
     if args.fp16:
         try:
@@ -138,7 +143,10 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
-                # print('hier_mask', batch['hier_mask'])
+            elif args.model_type == 'ba_bert':
+                inputs['hier_mask'] = batch['hier_mask']
+                inputs['behavior_rel_pos_mask'] = batch['behavior_rel_pos_mask']
+                inputs['behavior_type_mask'] = batch['behavior_type_mask']
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
@@ -157,8 +165,9 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
 
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                scheduler.step()  # Update learning rate schedule
                 optimizer.step()
+                scheduler.step()  # Update learning rate schedule
+                
                 model.zero_grad()
                 global_step += 1
 
@@ -236,7 +245,8 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
 
     args.eval_batch_size = batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+    # eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+    eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, 
                                  batch_size=args.eval_batch_size, num_workers=args.num_workers)
 
@@ -252,7 +262,6 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         model.eval()
         eval_guids = batch['guid']
-        all_eval_guids.extend(eval_guids)
         # batch = tuple(t.to(args.device) for t in batch)
         batch = {k: v.to(args.device) for k, v in batch.items() if k != 'guid'}
         with torch.no_grad():
@@ -262,18 +271,45 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
+            elif args.model_type == 'ba_bert':
+                inputs['hier_mask'] = batch['hier_mask']
+                inputs['behavior_rel_pos_mask'] = batch['behavior_rel_pos_mask']
+                inputs['behavior_type_mask'] = batch['behavior_type_mask']
                 
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
             eval_loss += tmp_eval_loss.mean().item()
+                       
+            if args.local_rank not in [-1, 0]:
+                gather_logits = [torch.ones_like(logits) for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather(gather_logits, logits)
+
+                gather_eval_guids = [torch.ones_like(eval_guids) for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather(gather_eval_guids, eval_guids)
+                all_eval_guids.extend(gather_eval_guids)
+
+                label_ids = inputs['labels']
+                gather_label_ids = [torch.ones_like(label_ids) for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather(gather_label_ids, label_ids)
+            else:
+                all_eval_guids.extend(eval_guids)
+            
 
         nb_eval_steps += 1
         if preds is None:
-            preds = logits.detach().cpu().numpy()
-            out_label_ids = inputs['labels'].detach().cpu().numpy()
+            if args.local_rank in [-1, 0]:
+                preds = logits.detach().cpu().numpy()
+                out_label_ids = inputs['labels'].detach().cpu().numpy()
+            else:
+                preds = gather_logits.detach().cpu().numpy()
+                out_label_ids = gather_label_ids.detach().cpu().numpy()
         else:
-            preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-            out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
+            if args.local_rank in [-1, 0]:
+                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+                out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
+            else:
+                preds = np.append(preds, gather_logits.detach().cpu().numpy(), axis=0)
+                out_label_ids = np.append(out_label_ids, gather_label_ids.detach().cpu().numpy(), axis=0)
 
     eval_loss = eval_loss / nb_eval_steps
     if args.output_mode == "classification":
@@ -282,8 +318,13 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
         preds = np.squeeze(preds)
     elif args.output_mode == "ranking":
         preds = softmax(preds, axis=1)
-        preds = np.squeeze(preds[:, 1])    
-
+        # print(preds)
+        preds = np.squeeze(preds[:, 1])
+        # print(preds)
+        
+    # print(out_label_ids)
+    # print(all_eval_guids)
+    
     result, qrels, run = compute_metrics(eval_task, preds, out_label_ids, guids=all_eval_guids)
     results.update(result)
     eval_output = {'qrels': qrels,
@@ -311,19 +352,19 @@ parser = argparse.ArgumentParser()
 ## Required parameters
 parser.add_argument("--data_dir", default='/mnt/scratch/chenqu/aol/preprocessed/', type=str, required=False,
                     help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-parser.add_argument("--model_type", default='bert', type=str, required=False,
-                    help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
+parser.add_argument("--model_type", default='ba_bert', type=str, required=False,
+                    help="Model type selected in the list: [bert, ba_bert, hier]" )
 parser.add_argument("--model_name_or_path", default='/mnt/scratch/chenqu/huggingface/', type=str, required=False,
                     help="Path to pre-trained model or shortcut name")
 parser.add_argument("--task_name", default='stateful_search', type=str, required=False,
                     help="The name of the task to train")
-parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/bert/', type=str, required=False,
+parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/ba_bert/', type=str, required=False,
                     help="The output directory where the model predictions and checkpoints will be written.")
 
 ## Other parameters
 parser.add_argument("--config_name", default="", type=str,
                     help="Pretrained config name or path if not the same as model_name")
-parser.add_argument("--tokenizer_name", default="", type=str,
+parser.add_argument("--tokenizer_name", default="bert-base-uncased", type=str,
                     help="Pretrained tokenizer name or path if not the same as model_name")
 parser.add_argument("--cache_dir", default="", type=str,
                     help="Where do you want to store the pre-trained models downloaded from s3")
@@ -341,9 +382,9 @@ parser.add_argument("--do_lower_case", default=True, type=str2bool,
 
 parser.add_argument("--per_gpu_train_batch_size", default=6, type=int,
                     help="Batch size per GPU/CPU for training.")
-parser.add_argument("--per_gpu_eval_batch_size", default=2, type=int,
+parser.add_argument("--per_gpu_eval_batch_size", default=192, type=int,
                     help="Batch size per GPU/CPU for evaluation.")
-parser.add_argument("--per_gpu_test_batch_size", default=2, type=int,
+parser.add_argument("--per_gpu_test_batch_size", default=24, type=int,
                     help="Batch size per GPU/CPU for testing.")
 parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                     help="Number of updates steps to accumulate before performing a backward/update pass.")
@@ -400,8 +441,10 @@ parser.add_argument("--dataset", default='aol', type=str, required=False,
                     help="aol or msmarco. For bing data, we do not use the first query in a session")
 parser.add_argument("--history_num", default=1, type=int, required=False,
                     help="number of history turns to concat")
-parser.add_argument("--num_workers", default=2, type=int, required=False,
+parser.add_argument("--num_workers", default=0, type=int, required=False,
                     help="number of workers for dataloader")
+parser.add_argument("--warmup_portion", default=0.1, type=float,
+                    help="Linear warmup over warmup_steps (=t_total * warmup_portion). override warmup_steps ")
 
 # args = parser.parse_args()
 args, unknown = parser.parse_known_args()
@@ -456,6 +499,7 @@ config = config_class.from_pretrained(args.config_name if args.config_name else 
 tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
 tokenizer.add_tokens(['[EMPTY_QUERY]', '[EMPTY_TITLE]'])
 model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
+model.resize_token_embeddings(len(tokenizer))
 
 if args.local_rank == 0:
     torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -486,6 +530,16 @@ if args.do_train:
                                  args.history_num)
     global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer)
     logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+    
+    tokenizer.save_pretrained(args.output_dir)
+    
+if not args.do_train and args.do_eval:
+    eval_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_dev_small.txt"), args.include_skipped, 
+                                args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
+                                 args.history_num)
+    test_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_test.txt"), args.include_skipped, 
+                                args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
+                                 args.history_num)
 
 
 # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
@@ -520,7 +574,7 @@ if args.do_eval and args.local_rank in [-1, 0]:
     logging.getLogger("pytorch_transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
     logger.info("Evaluate the following checkpoints: %s", checkpoints)
     for checkpoint in checkpoints:
-        global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+        global_step = checkpoint.split('-')[-1]
         model = model_class.from_pretrained(checkpoint)
         model.to(args.device)
         result, eval_output = evaluate(args, eval_dataset, model, tokenizer, 

@@ -109,6 +109,10 @@ class ConcatModelDataset(LazyTextDataset):
         
         data_point = json.loads(line.strip())
         guid = data_point['guid']
+        guid_splits = guid.split('_')
+        query_id = ''.join(guid_splits[:2])
+        doc_id = ''.join(guid_splits)
+        
         query = data_point['query']
         title = data_point['title']
         label = data_point['label']
@@ -141,7 +145,7 @@ class ConcatModelDataset(LazyTextDataset):
         
         # construct hier mask:
         # e.g. input_ids: [101, 2, 2, 2, 102, 3, 3, 3, 102, 4, 102, 5, 102, 6, 6, 102, 0, 0]
-        #      hier_mask: [-1 , 5, 5, 5, -1 , 4, 4, 4, -1 , 3, -1 , 2, -1 , 1, 1, -1 , 0, 0]
+        #      hier_mask: [5  , 5, 5, 5, 5  , 4, 4, 4, 4 ,  3, 3 ,  2, 2  , 1, 1, 1 , 0, 0]
         sep_indices = np.where(input_ids == 102)[0]
         hier_mask = np.zeros_like(input_ids)
         for sep_index in sep_indices:
@@ -149,9 +153,24 @@ class ConcatModelDataset(LazyTextDataset):
         # hier_mask[sep_indices] = -1
         # hier_mask[0] = -1
         
+        if self._include_skipped:
+            # input:             q_n-1      d_n-1^+    d_n-1^-  q_n   d
+            # hier_mask:    [5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 2, 2, 1, 1, 1, 0, 0]
+            # rel_pos_mask: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+            # type_mask:    [1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 1, 1, 3, 3, 3, 0, 0]
+            # four behavior types: query, d(positive), d(negative), and d(current)
+            behavior_rel_pos_mask = hier_mask // 3 
+            behavior_type_mask = (hier_mask + 2) % 3
+            behavior_type_mask[hier_mask == 1] = 3
+        else:
+            behavior_rel_pos_mask = (hier_mask - 1) // 2 
+            behavior_type_mask = (hier_mask + 1) % 2
+            behavior_type_mask[hier_mask == 1] = 3
+        
         # the history mask is not used
         return {'input_ids': input_ids, 'segment_ids': segment_ids, 'input_mask': input_mask,
-               'ranker_label_ids': ranker_label_ids, 'guid': guid, 'history_mask': 1, 'hier_mask': hier_mask}
+               'ranker_label_ids': ranker_label_ids, 'guid': guid, 'history_mask': 1, 'hier_mask': hier_mask,
+               'behavior_rel_pos_mask': behavior_rel_pos_mask, 'behavior_type_mask': behavior_type_mask}
 
 
 def convert_examples_to_features(examples, label_list, max_seq_length,
@@ -367,11 +386,14 @@ def trec_eval(preds, labels, guids):
         else:
             run[query_id] = {doc_id: float(pred)}
             
-    evaluator = pytrec_eval.RelevanceEvaluator(qrels, {'recip_rank', 'ndcg'})
+    evaluator = pytrec_eval.RelevanceEvaluator(qrels, {'recip_rank', 'ndcg', 'ndcg_cut'})
     res = evaluator.evaluate(run)
     mrr_list = [v['recip_rank'] for v in res.values()]
     ndcg_list = [v['ndcg'] for v in res.values()]
-    return {'mrr': np.average(mrr_list), 'ndcg': np.average(ndcg_list)}, qrels, run
+    ndcg_10_list = [v['ndcg_cut_10'] for v in res.values()]
+    return {'mrr': np.average(mrr_list), 
+            'ndcg': np.average(ndcg_list),
+            'ndcg_10': np.average(ndcg_10_list)}, qrels, run
 
 
 output_modes = {
