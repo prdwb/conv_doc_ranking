@@ -351,4 +351,125 @@ class BehaviorAwareBertEmbeddings(BertEmbeddings):
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings      
+
+class HierAttBertConcatForStatefulSearch(BertPreTrainedModel):
+    """ Use BertConcat as usual, then obtain a rep for each turn with multi-head att on the tokens in this turn.
+    Finally do another multi-head att on all rep: [CLS] [rep for current turn] ... [rep for first turn]
+    """
+
+    def __init__(self, config):
+        super(HierAttBertConcatForStatefulSearch, self).__init__(config)
+        self.num_labels = config.num_labels
+
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
+        
+        self.turn_att = BertLayer(config)
+        self.sess_att = BertLayer(config)
+        
+        self.pooler = BertPooler(config)
+
+        self.init_weights()
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
+                position_ids=None, head_mask=None, hier_mask=None, 
+                behavior_rel_pos_mask=None, behavior_type_mask=None):
+        
+        # run bert concat and get contextual rep for every token
+        outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
+                            attention_mask=attention_mask, head_mask=head_mask)
+        sequence_output = outputs[0]
+        
+        behavior_rel_pos_mask_plus = behavior_rel_pos_mask + 1
+        behavior_rel_pos_mask_plus[attention_mask == 0] = 0
+        # print('behavior_rel_pos_mask_plus', behavior_rel_pos_mask_plus)
+        
+        # isolate each turn and run a bert layer to get a rep for each turn
+        batch_size, max_seq_len, hidden_size = sequence_output.size()        
+        within_turn_attention_mask_list = []
+        hidden_states_list = []
+        target_ids = list(range(1, behavior_rel_pos_mask_plus.max() + 1))
+        # print('target_ids', target_ids)
+    
+        for target_id in target_ids:
+            mask = torch.zeros_like(behavior_rel_pos_mask_plus, device=behavior_rel_pos_mask_plus.device)
+            mask[behavior_rel_pos_mask_plus == target_id] = 1
+            mask[:, 0] = 1
+            within_turn_attention_mask_list.append(deepcopy(mask))
+            hidden_states_list.append(sequence_output)
+        
+        within_turn_attention_mask = torch.cat(within_turn_attention_mask_list, dim=0)
+        # print('within_turn_attention_mask', within_turn_attention_mask)
+        all_hidden_states = torch.cat(hidden_states_list, dim=0)
+        # print('attention_mask size', attention_mask.size())
+        # print('all_hidden_states size', all_hidden_states.size())
+        
+        extended_attention_mask = within_turn_attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        # print('all_hidden_states', all_hidden_states.tolist())
+        layer_outputs = self.turn_att(all_hidden_states, extended_attention_mask)
+        outputs = layer_outputs[0]
+        
+        splits = outputs.split(batch_size, dim=0)
+        turn_reps = [sequence_output[:, 0]]
+        for split, mask in zip(splits, within_turn_attention_mask_list):
+            mask = mask.float()
+            turn_rep = split * mask.unsqueeze(-1)
+            turn_rep_sum = turn_rep.sum(dim=1)
+            turn_rep = turn_rep_sum / mask.sum(dim=1, keepdim=True)
+            turn_reps.append(turn_rep)
+        turn_reps = torch.stack(turn_reps, dim=1)
+        
+        # run a bert layer on all turn reps: [CLS] [rep for current turn] ... [rep for first turn]
+        turn_mask_len = behavior_rel_pos_mask_plus.max(dim=1).values + 1
+        # max_len = turn_mask_len.max() + 1
+        max_len = 5
+        turn_mask = torch.arange(max_len, device=behavior_rel_pos_mask_plus.device,
+                       dtype=behavior_rel_pos_mask_plus.dtype).expand(len(turn_mask_len), max_len) < turn_mask_len.unsqueeze(1)
+        turn_mask = torch.as_tensor(turn_mask, dtype=behavior_rel_pos_mask_plus.dtype, 
+                                               device=behavior_rel_pos_mask_plus.device)
+        # print('turn_mask', turn_mask)
+                
+        extended_attention_mask = turn_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        # print('turn_reps', turn_reps.tolist())
+        
+        # pad turn_reps
+        turn_reps_padding = torch.ones((batch_size, max_len - turn_reps.size(1), hidden_size), 
+                                       dtype=turn_reps.dtype, device=turn_reps.device)
+        turn_reps = torch.cat((turn_reps, turn_reps_padding), dim=1)
+        
+        # TODO: add pos embed and layer norm ...
+        
+        layer_outputs = self.sess_att(turn_reps, extended_attention_mask)
+        sess_att_output = layer_outputs[0]
+        pooled_output = self.pooler(sess_att_output)
+        
+        pooled_output = self.dropout(pooled_output)      
+        logits = self.classifier(pooled_output)
+
+        outputs = (logits,) + layer_outputs[2:]  # add hidden states and attention if they are here
+
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            outputs = (loss,) + outputs
+
+        return outputs  # (loss), logits, (hidden_states), (attentions)
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     

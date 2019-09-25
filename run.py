@@ -6,7 +6,7 @@
 
 # import os
 # os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"]="0"
+# os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 
 # In[2]:
@@ -32,7 +32,8 @@ from tqdm import tqdm, trange
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig, BertTokenizer)
 from modeling import (BertConcatForStatefulSearch, 
                       BehaviorAwareBertConcatForStatefulSearch, 
-                      HierBertConcatForStatefulSearch,)
+                      HierBertConcatForStatefulSearch, 
+                      HierAttBertConcatForStatefulSearch)
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
@@ -48,7 +49,8 @@ logger = logging.getLogger(__name__)
 MODEL_CLASSES = {
     'bert': (BertConfig, BertConcatForStatefulSearch, BertTokenizer),
     'ba_bert': (BertConfig, BehaviorAwareBertConcatForStatefulSearch, BertTokenizer),
-    'hier': (BertConfig, HierBertConcatForStatefulSearch, BertTokenizer)
+    'hier': (BertConfig, HierBertConcatForStatefulSearch, BertTokenizer),
+    'hier_att': (BertConfig, HierAttBertConcatForStatefulSearch, BertTokenizer),
 }
 
 def set_seed(args):
@@ -143,10 +145,13 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
-            elif args.model_type == 'ba_bert':
+            elif args.model_type in ['ba_bert', 'hier_att']:
                 inputs['hier_mask'] = batch['hier_mask']
                 inputs['behavior_rel_pos_mask'] = batch['behavior_rel_pos_mask']
                 inputs['behavior_type_mask'] = batch['behavior_type_mask']
+                # print('hier_mask', batch['hier_mask'].tolist())
+                # print('behavior_rel_pos_mask', batch['behavior_rel_pos_mask'].tolist())
+                # print('behavior_type_mask', batch['behavior_type_mask'].tolist())
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
@@ -259,6 +264,7 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
     preds = None
     out_label_ids = None
     all_eval_guids = []
+    all_query_ids, all_doc_ids = None, None
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         model.eval()
         eval_guids = batch['guid']
@@ -271,10 +277,11 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
-            elif args.model_type == 'ba_bert':
+            elif args.model_type in ['ba_bert', 'hier_att']:
                 inputs['hier_mask'] = batch['hier_mask']
                 inputs['behavior_rel_pos_mask'] = batch['behavior_rel_pos_mask']
                 inputs['behavior_type_mask'] = batch['behavior_type_mask']
+                
                 
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
@@ -283,10 +290,14 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
             if args.local_rank not in [-1, 0]:
                 gather_logits = [torch.ones_like(logits) for _ in range(torch.distributed.get_world_size())]
                 torch.distributed.all_gather(gather_logits, logits)
-
-                gather_eval_guids = [torch.ones_like(eval_guids) for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather(gather_eval_guids, eval_guids)
-                all_eval_guids.extend(gather_eval_guids)
+                
+                query_ids = batch['query_id']                
+                gather_query_ids = [torch.ones_like(query_ids) for _ in range(torch.distributed.get_world_size())]                
+                torch.distributed.all_gather(gather_query_ids, query_ids)
+                
+                doc_ids = batch['doc_id']
+                gather_doc_ids = [torch.ones_like(doc_ids) for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather(gather_doc_ids, doc_ids)              
 
                 label_ids = inputs['labels']
                 gather_label_ids = [torch.ones_like(label_ids) for _ in range(torch.distributed.get_world_size())]
@@ -303,6 +314,9 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
             else:
                 preds = gather_logits.detach().cpu().numpy()
                 out_label_ids = gather_label_ids.detach().cpu().numpy()
+                all_query_ids = gather_query_ids.detach().cpu().numpy()
+                all_doc_ids = gather_doc_ids.detach().cpu().numpy()
+                
         else:
             if args.local_rank in [-1, 0]:
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
@@ -310,6 +324,8 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
             else:
                 preds = np.append(preds, gather_logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, gather_label_ids.detach().cpu().numpy(), axis=0)
+                all_query_ids = np.append(all_query_ids, gather_query_ids.detach().cpu().numpy(), axis=0)
+                all_doc_ids = np.append(all_doc_ids, gather_doc_ids.detach().cpu().numpy(), axis=0)
 
     eval_loss = eval_loss / nb_eval_steps
     if args.output_mode == "classification":
@@ -324,8 +340,11 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
         
     # print(out_label_ids)
     # print(all_eval_guids)
-    
-    result, qrels, run = compute_metrics(eval_task, preds, out_label_ids, guids=all_eval_guids)
+    if args.local_rank in [-1, 0]:
+        result, qrels, run = compute_metrics(eval_task, preds, out_label_ids, guids=all_eval_guids)
+    else:
+        result, qrels, run = compute_metrics(eval_task, preds, out_label_ids, 
+                                             query_ids=all_query_ids, doc_ids=all_doc_ids)
     results.update(result)
     eval_output = {'qrels': qrels,
                   'run': run,
@@ -352,13 +371,13 @@ parser = argparse.ArgumentParser()
 ## Required parameters
 parser.add_argument("--data_dir", default='/mnt/scratch/chenqu/aol/preprocessed/', type=str, required=False,
                     help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-parser.add_argument("--model_type", default='ba_bert', type=str, required=False,
-                    help="Model type selected in the list: [bert, ba_bert, hier]" )
+parser.add_argument("--model_type", default='hier_att', type=str, required=False,
+                    help="Model type selected in the list: [bert, ba_bert, hier, hier_att]" )
 parser.add_argument("--model_name_or_path", default='/mnt/scratch/chenqu/huggingface/', type=str, required=False,
                     help="Path to pre-trained model or shortcut name")
 parser.add_argument("--task_name", default='stateful_search', type=str, required=False,
                     help="The name of the task to train")
-parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/ba_bert/', type=str, required=False,
+parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/hier_att/', type=str, required=False,
                     help="The output directory where the model predictions and checkpoints will be written.")
 
 ## Other parameters
@@ -368,7 +387,7 @@ parser.add_argument("--tokenizer_name", default="bert-base-uncased", type=str,
                     help="Pretrained tokenizer name or path if not the same as model_name")
 parser.add_argument("--cache_dir", default="", type=str,
                     help="Where do you want to store the pre-trained models downloaded from s3")
-parser.add_argument("--max_seq_length", default=128, type=int,
+parser.add_argument("--max_seq_length", default=32, type=int,
                     help="The maximum total input sequence length after tokenization. Sequences longer "
                          "than this will be truncated, sequences shorter will be padded.")
 parser.add_argument("--do_train", default=True, type=str2bool,
@@ -380,7 +399,7 @@ parser.add_argument("--evaluate_during_training", default=True, type=str2bool,
 parser.add_argument("--do_lower_case", default=True, type=str2bool,
                     help="Set this flag if you are using an uncased model.")
 
-parser.add_argument("--per_gpu_train_batch_size", default=6, type=int,
+parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                     help="Batch size per GPU/CPU for training.")
 parser.add_argument("--per_gpu_eval_batch_size", default=192, type=int,
                     help="Batch size per GPU/CPU for evaluation.")
@@ -625,4 +644,10 @@ if args.do_eval and args.local_rank in [-1, 0]:
 
 # if __name__ == "__main__":
 #     main()
+
+
+# In[ ]:
+
+
+
 

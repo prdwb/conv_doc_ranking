@@ -110,8 +110,8 @@ class ConcatModelDataset(LazyTextDataset):
         data_point = json.loads(line.strip())
         guid = data_point['guid']
         guid_splits = guid.split('_')
-        query_id = ''.join(guid_splits[:2])
-        doc_id = ''.join(guid_splits)
+        query_id = int(''.join(guid_splits[:2]))
+        doc_id = int(''.join(guid_splits))
         
         query = data_point['query']
         title = data_point['title']
@@ -160,17 +160,25 @@ class ConcatModelDataset(LazyTextDataset):
             # type_mask:    [1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 1, 1, 3, 3, 3, 0, 0]
             # four behavior types: query, d(positive), d(negative), and d(current)
             behavior_rel_pos_mask = hier_mask // 3 
+            behavior_rel_pos_mask[0] = 0 # set [CLS] to 0
+            
             behavior_type_mask = (hier_mask + 2) % 3
             behavior_type_mask[hier_mask == 1] = 3
+            behavior_type_mask[0] = 3 # set [CLS] to 3, which is the same for current d
+            
         else:
             behavior_rel_pos_mask = (hier_mask - 1) // 2 
+            behavior_rel_pos_mask[0] = 0
+            
             behavior_type_mask = (hier_mask + 1) % 2
             behavior_type_mask[hier_mask == 1] = 3
+            behavior_type_mask[0] = 3
         
         # the history mask is not used
         return {'input_ids': input_ids, 'segment_ids': segment_ids, 'input_mask': input_mask,
                'ranker_label_ids': ranker_label_ids, 'guid': guid, 'history_mask': 1, 'hier_mask': hier_mask,
-               'behavior_rel_pos_mask': behavior_rel_pos_mask, 'behavior_type_mask': behavior_type_mask}
+               'behavior_rel_pos_mask': behavior_rel_pos_mask, 'behavior_type_mask': behavior_type_mask, 
+               'query_id': query_id, 'doc_id': doc_id}
 
 
 def convert_examples_to_features(examples, label_list, max_seq_length,
@@ -341,7 +349,9 @@ def pearson_and_spearman(preds, labels):
     }
 
 
-def compute_metrics(task_name, preds, labels, guids=None):
+def compute_metrics(task_name, preds, labels, guids=None, 
+                    query_ids=None, doc_ids=None):
+    
     assert len(preds) == len(labels)
     if task_name == "cola":
         return {"mcc": matthews_corrcoef(labels, preds)}
@@ -364,27 +374,42 @@ def compute_metrics(task_name, preds, labels, guids=None):
     elif task_name == "wnli":
         return {"acc": simple_accuracy(preds, labels)}
     elif task_name == 'stateful_search':
-        return trec_eval(preds, labels, guids)
+        return trec_eval(preds, labels, guids, query_ids, doc_ids)
     else:
         raise KeyError(task_name)
         
-def trec_eval(preds, labels, guids):
+def trec_eval(preds, labels, guids, query_ids, doc_ids):
     qrels = {}
     run = {}
-    for pred, label, guid in zip(preds, labels, guids):
-        guid_splits = guid.split('_')
-        query_id = '_'.join(guid_splits[: 2])
-        doc_id = guid_splits[-1]
-        
-        if query_id in qrels:
-            qrels[query_id][doc_id] = int(label)
-        else:
-            qrels[query_id] = {doc_id: int(label)}
-        
-        if query_id in run:
-            run[query_id][doc_id] = float(pred)
-        else:
-            run[query_id] = {doc_id: float(pred)}
+    
+    if guids:
+        for pred, label, guid in zip(preds, labels, guids):
+            guid_splits = guid.split('_')
+            query_id = '_'.join(guid_splits[: 2])
+            doc_id = guid_splits[-1]
+
+            if query_id in qrels:
+                qrels[query_id][doc_id] = int(label)
+            else:
+                qrels[query_id] = {doc_id: int(label)}
+
+            if query_id in run:
+                run[query_id][doc_id] = float(pred)
+            else:
+                run[query_id] = {doc_id: float(pred)}
+    else:
+        for pred, label, query_id, doc_id in zip(preds, labels, query_ids, doc_ids):
+            query_id = str(query_id)
+            doc_id = str(doc_id)
+            if query_id in qrels:
+                qrels[query_id][doc_id] = int(label)
+            else:
+                qrels[query_id] = {doc_id: int(label)}
+
+            if query_id in run:
+                run[query_id][doc_id] = float(pred)
+            else:
+                run[query_id] = {doc_id: float(pred)}
             
     evaluator = pytrec_eval.RelevanceEvaluator(qrels, {'recip_rank', 'ndcg', 'ndcg_cut'})
     res = evaluator.evaluate(run)
