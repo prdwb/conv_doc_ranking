@@ -6,7 +6,7 @@
 
 # import os
 # os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"]="1"
+# os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 
 # In[2]:
@@ -33,7 +33,8 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig, BertTokenizer)
 from modeling import (BertConcatForStatefulSearch, 
                       BehaviorAwareBertConcatForStatefulSearch, 
                       HierBertConcatForStatefulSearch, 
-                      HierAttBertConcatForStatefulSearch)
+                      HierAttBertConcatForStatefulSearch, 
+                      BehaviorAwareHierAttBertConcatForStatefulSearch)
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
@@ -51,6 +52,7 @@ MODEL_CLASSES = {
     'ba_bert': (BertConfig, BehaviorAwareBertConcatForStatefulSearch, BertTokenizer),
     'hier': (BertConfig, HierBertConcatForStatefulSearch, BertTokenizer),
     'hier_att': (BertConfig, HierAttBertConcatForStatefulSearch, BertTokenizer),
+    'ba_hier_att': (BertConfig, BehaviorAwareHierAttBertConcatForStatefulSearch, BertTokenizer),
 }
 
 def set_seed(args):
@@ -145,7 +147,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
-            elif args.model_type in ['ba_bert', 'hier_att']:
+            elif args.model_type in ['ba_bert', 'hier_att', 'ba_hier_att']:
                 inputs['hier_mask'] = batch['hier_mask']
                 inputs['behavior_rel_pos_mask'] = batch['behavior_rel_pos_mask']
                 inputs['behavior_type_mask'] = batch['behavior_type_mask']
@@ -277,7 +279,7 @@ def evaluate(args, eval_dataset, model, tokenizer, batch_size, prefix=""):
                       'labels':         batch['ranker_label_ids']}
             if args.model_type == 'hier':
                 inputs['hier_mask'] = batch['hier_mask']
-            elif args.model_type in ['ba_bert', 'hier_att']:
+            elif args.model_type in ['ba_bert', 'hier_att', 'ba_hier_att']:
                 inputs['hier_mask'] = batch['hier_mask']
                 inputs['behavior_rel_pos_mask'] = batch['behavior_rel_pos_mask']
                 inputs['behavior_type_mask'] = batch['behavior_type_mask']
@@ -371,13 +373,13 @@ parser = argparse.ArgumentParser()
 ## Required parameters
 parser.add_argument("--data_dir", default='/mnt/scratch/chenqu/aol/preprocessed/', type=str, required=False,
                     help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-parser.add_argument("--model_type", default='hier_att', type=str, required=False,
-                    help="Model type selected in the list: [bert, ba_bert, hier, hier_att]" )
+parser.add_argument("--model_type", default='ba_hier_att', type=str, required=False,
+                    help="Model type selected in the list: [bert, ba_bert, hier, hier_att, ba_hier_att]" )
 parser.add_argument("--model_name_or_path", default='/mnt/scratch/chenqu/huggingface/', type=str, required=False,
                     help="Path to pre-trained model or shortcut name")
 parser.add_argument("--task_name", default='stateful_search', type=str, required=False,
                     help="The name of the task to train")
-parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/hier_att/', type=str, required=False,
+parser.add_argument("--output_dir", default='/mnt/scratch/chenqu/stateful_search/ba_hier_att/', type=str, required=False,
                     help="The output directory where the model predictions and checkpoints will be written.")
 
 ## Other parameters
