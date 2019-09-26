@@ -2,7 +2,7 @@ import torch
 from pytorch_transformers import BertModel, BertPreTrainedModel
 from pytorch_transformers.modeling_bert import (BertEncoder, BertOutput, BertAttention, 
                                                 BertIntermediate, BertLayer, BertEmbeddings,
-                                                BertPooler)
+                                                BertPooler, BertLayerNorm)
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from copy import deepcopy
@@ -368,6 +368,7 @@ class HierAttBertConcatForStatefulSearch(BertPreTrainedModel):
         self.turn_att = BertLayer(config)
         self.sess_att = BertLayer(config)
         
+        self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.pooler = BertPooler(config)
 
         self.init_weights()
@@ -439,12 +440,19 @@ class HierAttBertConcatForStatefulSearch(BertPreTrainedModel):
         
         # print('turn_reps', turn_reps.tolist())
         
-        # pad turn_reps
+        # pad turn_repsclasscls  
         turn_reps_padding = torch.ones((batch_size, max_len - turn_reps.size(1), hidden_size), 
                                        dtype=turn_reps.dtype, device=turn_reps.device)
         turn_reps = torch.cat((turn_reps, turn_reps_padding), dim=1)
         
-        # TODO: add pos embed and layer norm ...
+        # the position_ids is actually the reverse turn ids
+        position_ids = torch.arange(max_len, dtype=torch.long, device=turn_reps.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(turn_mask)        
+        position_embeddings = self.bert.embeddings.position_embeddings(position_ids)
+
+        turn_reps += position_embeddings
+        turn_reps = self.LayerNorm(turn_reps)
+        turn_reps = self.dropout(turn_reps)
         
         layer_outputs = self.sess_att(turn_reps, extended_attention_mask)
         sess_att_output = layer_outputs[0]
