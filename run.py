@@ -389,7 +389,7 @@ parser.add_argument("--tokenizer_name", default="bert-base-uncased", type=str,
                     help="Pretrained tokenizer name or path if not the same as model_name")
 parser.add_argument("--cache_dir", default="", type=str,
                     help="Where do you want to store the pre-trained models downloaded from s3")
-parser.add_argument("--max_seq_length", default=32, type=int,
+parser.add_argument("--max_seq_length", default=64, type=int,
                     help="The maximum total input sequence length after tokenization. Sequences longer "
                          "than this will be truncated, sequences shorter will be padded.")
 parser.add_argument("--do_train", default=True, type=str2bool,
@@ -450,17 +450,22 @@ parser.add_argument('--server_ip', type=str, default='', help="For distant debug
 parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
 
 # parameters we added
-parser.add_argument("--include_skipped", default=True, type=str2bool, required=False,
+parser.add_argument("--include_clicked", default=True, type=str2bool, required=False,
+                    help="whether to include the clicked doc from prev turn")
+parser.add_argument("--include_skipped", default=False, type=str2bool, required=False,
                     help="whether to include the skipped doc from prev turn")
-parser.add_argument("--enable_turn_id_embeddings", default=True, type=str2bool, required=False,
-                    help="whether to enable turn id embeddings")
-parser.add_argument("--enable_component_embeddings", default=True, type=str2bool, required=False,
-                    help="whether to enable component embeddings")
+parser.add_argument("--enable_behavior_rel_pos_embeddings", default=False, type=str2bool, required=False,
+                    help="whether to enable behavior relative postion (turn id) embeddings")
+parser.add_argument("--enable_regular_pos_embeddings_in_sess_att", default=False, type=str2bool, required=False,
+                    help="use the regular position embedding in bert for sess att")
+parser.add_argument("--enable_behavior_type_embeddings", default=True, type=str2bool, required=False,
+                    help="whether to enable behavior type embeddings")
+
 parser.add_argument("--load_small", default=True, type=str2bool, required=False,
                     help="whether to just a small portion of data during development")
 parser.add_argument("--dataset", default='aol', type=str, required=False,
                     help="aol or msmarco. For bing data, we do not use the first query in a session")
-parser.add_argument("--history_num", default=1, type=int, required=False,
+parser.add_argument("--history_num", default=3, type=int, required=False,
                     help="number of history turns to concat")
 parser.add_argument("--num_workers", default=0, type=int, required=False,
                     help="number of workers for dataloader")
@@ -517,6 +522,11 @@ if args.local_rank not in [-1, 0]:
 args.model_type = args.model_type.lower()
 config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
 config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
+config.enable_behavior_rel_pos_embeddings = args.enable_behavior_rel_pos_embeddings
+config.enable_regular_pos_embeddings_in_sess_att = args.enable_regular_pos_embeddings_in_sess_att
+config.enable_behavior_type_embeddings = args.enable_behavior_type_embeddings
+config.include_skipped = args.include_skipped
+
 tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
 tokenizer.add_tokens(['[EMPTY_QUERY]', '[EMPTY_TITLE]'])
 model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
@@ -540,27 +550,27 @@ logger.info("Training/evaluation parameters %s", args)
 # Training
 if args.do_train:
     # train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-    train_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_train.txt"), args.include_skipped,
-                               args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
-                                 args.history_num)
-    eval_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_dev_small.txt"), args.include_skipped, 
-                                args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
-                                 args.history_num)
-    test_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_test.txt"), args.include_skipped, 
-                                args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
-                                 args.history_num)
+    train_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_train.txt"), args.include_clicked, 
+                                       args.include_skipped, args.max_seq_length, tokenizer, 
+                                       args.output_mode, args.load_small, args.dataset, args.history_num)
+    eval_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_dev_small.txt"), args.include_clicked, 
+                                      args.include_skipped, args.max_seq_length, tokenizer, 
+                                      args.output_mode, args.load_small, args.dataset, args.history_num)
+    test_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_test.txt"), args.include_clicked, 
+                                      args.include_skipped, args.max_seq_length, tokenizer, 
+                                      args.output_mode, args.load_small, args.dataset, args.history_num)
     global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer)
     logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
     
     tokenizer.save_pretrained(args.output_dir)
     
 if not args.do_train and args.do_eval:
-    eval_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_dev_small.txt"), args.include_skipped, 
-                                args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
-                                 args.history_num)
-    test_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_test.txt"), args.include_skipped, 
-                                args.max_seq_length, tokenizer, args.output_mode, args.load_small, args.dataset,
-                                 args.history_num)
+    eval_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_dev_small.txt"), args.include_clicked, 
+                                      args.include_skipped, args.max_seq_length, tokenizer, 
+                                      args.output_mode, args.load_small, args.dataset, args.history_num)
+    test_dataset = ConcatModelDataset(os.path.join(args.data_dir, "session_test.txt"), args.include_clicked, 
+                                      args.include_skipped, args.max_seq_length, tokenizer, 
+                                      args.output_mode, args.load_small, args.dataset, args.history_num)
 
 
 # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
@@ -641,15 +651,9 @@ if args.do_eval and args.local_rank in [-1, 0]:
     # return results
 
 
-# In[7]:
+# In[ ]:
 
 
 # if __name__ == "__main__":
 #     main()
-
-
-# In[ ]:
-
-
-
 

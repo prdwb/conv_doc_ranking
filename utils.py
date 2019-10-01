@@ -65,9 +65,11 @@ class InputFeatures(object):
 
 
 class LazyTextDataset(Dataset):
-    def __init__(self, filename, include_skipped, max_seq_length, tokenizer, output_mode, load_small, dataset):
+    def __init__(self, filename, include_clicked, include_skipped, 
+                 max_seq_length, tokenizer, output_mode, load_small, dataset):
         
         self._filename = filename
+        self._include_clicked = include_clicked
         self._include_skipped = include_skipped
         self._label_list = ["False", "True"]
         self._max_seq_length = max_seq_length
@@ -92,9 +94,10 @@ class LazyTextDataset(Dataset):
         return self._total_data
     
 class ConcatModelDataset(LazyTextDataset):
-    def __init__(self, filename, include_skipped, max_seq_length, tokenizer, output_mode, load_small, dataset, history_num):
+    def __init__(self, filename, include_clicked, include_skipped, 
+                 max_seq_length, tokenizer, output_mode, load_small, dataset, history_num):
         
-        super(ConcatModelDataset, self).__init__(filename, include_skipped, 
+        super(ConcatModelDataset, self).__init__(filename, include_clicked, include_skipped, 
                                  max_seq_length, tokenizer, output_mode, load_small, dataset)
         self._history_num = history_num
 
@@ -120,10 +123,14 @@ class ConcatModelDataset(LazyTextDataset):
         examples = []
         history_text = ''
         
-        if not self._include_skipped:
+        if not self._include_skipped and self._include_clicked:
             if len(history) > 0:
                 history = np.asarray(history)
-                history = history[:, 0:2].tolist()
+                history = history[:, 0:2].tolist()               
+        if not self._include_clicked: # we assume that if not include click, then not include skip
+            if len(history) > 0:
+                history = np.asarray(history)
+                history = history[:, 0:1].tolist()
         
         for history_turn in history:
             for history_behavior in history_turn:

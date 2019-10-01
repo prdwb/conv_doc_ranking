@@ -491,6 +491,22 @@ class BehaviorAwareHierAttBertConcatForStatefulSearch(BertPreTrainedModel):
         
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.pooler = BertPooler(config)
+        
+        try:
+            self.enable_behavior_rel_pos_embeddings = config.enable_behavior_rel_pos_embeddings
+            self.enable_regular_pos_embeddings_in_sess_att = config.enable_regular_pos_embeddings_in_sess_att
+            self.enable_behavior_type_embeddings = config.enable_behavior_type_embeddings
+            self.include_skipped = config.include_skipped
+        except:
+            self.enable_behavior_rel_pos_embeddings = False
+            self.enable_regular_pos_embeddings_in_sess_att = True
+            self.enable_behavior_type_embeddings = False
+            self.include_skipped = True
+        
+        if self.enable_behavior_rel_pos_embeddings:
+            self.behavior_rel_pos_embeddings = nn.Embedding(4, config.hidden_size)
+        if self.enable_behavior_type_embeddings:
+            self.behavior_type_embeddings = nn.Embedding(4, config.hidden_size)
 
         self.init_weights()
 
@@ -562,12 +578,50 @@ class BehaviorAwareHierAttBertConcatForStatefulSearch(BertPreTrainedModel):
                                        dtype=behavior_reps.dtype, device=behavior_reps.device)
         behavior_reps = torch.cat((behavior_reps, behavior_reps_padding), dim=1)
         
-        # the position_ids is actually the reverse behavior ids
+        # suppose we have 1 history turn and include skip, 
+        # the position_ids is [0, 1, 2, 3, 4, 5, 6, 7, ..., 11]
         position_ids = torch.arange(max_len, dtype=torch.long, device=behavior_reps.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(behavior_mask)        
-        position_embeddings = self.bert.embeddings.position_embeddings(position_ids)
-
-        behavior_reps += position_embeddings
+        position_ids = position_ids.unsqueeze(0).expand_as(behavior_mask)
+        # print('position_ids', position_ids.tolist())
+        # masked_position_ids: [0, 1, 2, 3, 4, 0, 0, 0, ..., 0]
+        masked_position_ids = position_ids * behavior_mask
+        # masked_position_ids: [-5, -4, -3, -2, -1, -5, -5, -5, ..., -5]
+        masked_position_ids = masked_position_ids - (masked_position_ids.max(dim=1, keepdim=True).values + 1)
+        # masked_position_ids: [5, 4, 3, 2, 1, 5, 5, 5, ..., 5]
+        masked_position_ids = - masked_position_ids
+        # masked_position_ids: [5, 4, 3, 2, 1, 0, 0, 0, ..., 0]
+        masked_position_ids = masked_position_ids * behavior_mask
+        # print('masked_position_ids', masked_position_ids.tolist())
+        
+        if self.enable_regular_pos_embeddings_in_sess_att:
+            # the position_ids is actually the reverse behavior ids                
+            position_embeddings = self.bert.embeddings.position_embeddings(position_ids)
+            behavior_reps += position_embeddings
+        
+        if self.enable_behavior_rel_pos_embeddings:
+            if self.include_skipped:
+                agg_behavior_rel_pos_mask = masked_position_ids // 3 
+                agg_behavior_rel_pos_mask[:, 0] = 0 # set [CLS] to 0
+            else:
+                agg_behavior_rel_pos_mask = (masked_position_ids - 1) // 2 
+                agg_behavior_rel_pos_mask[:, 0] = 0
+            # print('agg_behavior_rel_pos_mask', agg_behavior_rel_pos_mask.tolist())
+            behavior_rel_pos_embeddings = self.behavior_rel_pos_embeddings(agg_behavior_rel_pos_mask)
+            behavior_reps += behavior_rel_pos_embeddings
+                        
+        if self.enable_behavior_type_embeddings:
+            if self.include_skipped:
+                agg_behavior_type_mask = (masked_position_ids + 2) % 3
+                agg_behavior_type_mask[masked_position_ids == 1] = 3
+                agg_behavior_type_mask[:, 0] = 3 # set [CLS] to 3, which is the same for current d
+            else:
+                agg_behavior_type_mask = (masked_position_ids + 1) % 2
+                agg_behavior_type_mask[masked_position_ids == 1] = 3
+                agg_behavior_type_mask[:, 0] = 3
+            # print('agg_behavior_type_mask', agg_behavior_type_mask.tolist())
+            behavior_type_embeddings = self.behavior_type_embeddings(agg_behavior_type_mask)
+            behavior_reps += behavior_type_embeddings
+        
         behavior_reps = self.LayerNorm(behavior_reps)
         behavior_reps = self.dropout(behavior_reps)
         
