@@ -461,6 +461,12 @@ parser.add_argument("--enable_regular_pos_embeddings_in_sess_att", default=False
 parser.add_argument("--enable_behavior_type_embeddings", default=True, type=str2bool, required=False,
                     help="whether to enable behavior type embeddings")
 
+parser.add_argument("--intra_att", default=False, type=str2bool, required=False,
+                    help="no intra behavior attention layer, use an avg pooling directly")
+parser.add_argument("--num_inter_att_layers", default=2, type=int, required=False,
+                    help="number of inter behavior attention layers")
+
+
 parser.add_argument("--load_small", default=True, type=str2bool, required=False,
                     help="whether to just a small portion of data during development")
 parser.add_argument("--dataset", default='aol', type=str, required=False,
@@ -526,6 +532,8 @@ config.enable_behavior_rel_pos_embeddings = args.enable_behavior_rel_pos_embeddi
 config.enable_regular_pos_embeddings_in_sess_att = args.enable_regular_pos_embeddings_in_sess_att
 config.enable_behavior_type_embeddings = args.enable_behavior_type_embeddings
 config.include_skipped = args.include_skipped
+config.intra_att = args.intra_att
+config.num_inter_att_layers = args.num_inter_att_layers
 
 tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
 tokenizer.add_tokens(['[EMPTY_QUERY]', '[EMPTY_TITLE]'])
@@ -651,7 +659,7 @@ if args.do_eval and args.local_rank in [-1, 0]:
     # return results
 
 
-# In[ ]:
+# In[7]:
 
 
 # if __name__ == "__main__":

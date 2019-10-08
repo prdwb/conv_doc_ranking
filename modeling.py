@@ -486,22 +486,28 @@ class BehaviorAwareHierAttBertConcatForStatefulSearch(BertPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
         
-        self.behavior_att = BertLayer(config)
-        self.sess_att = BertLayer(config)
+        self.enable_behavior_rel_pos_embeddings = (config.enable_behavior_rel_pos_embeddings 
+                                                   if hasattr(config, 'enable_behavior_rel_pos_embeddings') 
+                                                   else False)
+        self.enable_regular_pos_embeddings_in_sess_att = (config.enable_regular_pos_embeddings_in_sess_att
+                                                          if hasattr(config, 'enable_regular_pos_embeddings_in_sess_att') 
+                                                          else True)
+        self.enable_behavior_type_embeddings = (config.enable_behavior_type_embeddings 
+                                                if hasattr(config, 'enable_behavior_type_embeddings') 
+                                                else False)
+        self.include_skipped = config.include_skipped if hasattr(config, 'include_skipped') else True
+        
+        self.intra_att = config.intra_att if hasattr(config, 'intra_att') else True
+        self.num_inter_att_layers = config.num_inter_att_layers if hasattr(config, 'num_inter_att_layers') else 1
+        
+        if self.intra_att:
+            self.behavior_att = BertLayer(config)
+        # self.sess_att = BertLayer(config)
+        self.sess_att = nn.ModuleList([BertLayer(config) for _ in range(self.num_inter_att_layers)])
         
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.pooler = BertPooler(config)
-        
-        try:
-            self.enable_behavior_rel_pos_embeddings = config.enable_behavior_rel_pos_embeddings
-            self.enable_regular_pos_embeddings_in_sess_att = config.enable_regular_pos_embeddings_in_sess_att
-            self.enable_behavior_type_embeddings = config.enable_behavior_type_embeddings
-            self.include_skipped = config.include_skipped
-        except:
-            self.enable_behavior_rel_pos_embeddings = False
-            self.enable_regular_pos_embeddings_in_sess_att = True
-            self.enable_behavior_type_embeddings = False
-            self.include_skipped = True
+                
         
         if self.enable_behavior_rel_pos_embeddings:
             self.behavior_rel_pos_embeddings = nn.Embedding(4, config.hidden_size)
@@ -531,7 +537,7 @@ class BehaviorAwareHierAttBertConcatForStatefulSearch(BertPreTrainedModel):
         for target_id in target_ids:
             mask = torch.zeros_like(hier_mask, device=hier_mask.device)
             mask[hier_mask == target_id] = 1
-            mask[:, 0] = 1
+            mask[:, 0] = 1 # set [CLS] to 1
             within_behavior_attention_mask_list.append(deepcopy(mask))
             hidden_states_list.append(sequence_output)
         
@@ -545,8 +551,11 @@ class BehaviorAwareHierAttBertConcatForStatefulSearch(BertPreTrainedModel):
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         
         # print('all_hidden_states', all_hidden_states.tolist())
-        layer_outputs = self.behavior_att(all_hidden_states, extended_attention_mask)
-        outputs = layer_outputs[0]
+        if self.intra_att:
+            layer_outputs = self.behavior_att(all_hidden_states, extended_attention_mask)
+            outputs = layer_outputs[0]
+        else:
+            outputs = all_hidden_states
         
         splits = outputs.split(batch_size, dim=0)
         behavior_reps = [sequence_output[:, 0]]
@@ -625,10 +634,14 @@ class BehaviorAwareHierAttBertConcatForStatefulSearch(BertPreTrainedModel):
         behavior_reps = self.LayerNorm(behavior_reps)
         behavior_reps = self.dropout(behavior_reps)
         
-        layer_outputs = self.sess_att(behavior_reps, extended_attention_mask)
-        sess_att_output = layer_outputs[0]
-        pooled_output = self.pooler(sess_att_output)
+        # layer_outputs = self.sess_att(behavior_reps, extended_attention_mask)
+        # sess_att_output = layer_outputs[0]
+        for i, layer_module in enumerate(self.sess_att):
+            layer_outputs = layer_module(behavior_reps, extended_attention_mask)
+            behavior_reps = layer_outputs[0]
+        sess_att_output = behavior_reps  
         
+        pooled_output = self.pooler(sess_att_output)        
         pooled_output = self.dropout(pooled_output)      
         logits = self.classifier(pooled_output)
 
