@@ -3,7 +3,6 @@
 Code for our paper [Contextual Re-Ranking with Behavior Aware Transformers](http://ciir-publications.cs.umass.edu/getpdf.php?id=1383).
 
 ## Usage
-* `unzip pytrec_eval.zip` in the code directory. 
 * Follow the sample command:  
 ```
 python3 -u -m torch.distributed.launch --nproc_per_node 8 run.py \
